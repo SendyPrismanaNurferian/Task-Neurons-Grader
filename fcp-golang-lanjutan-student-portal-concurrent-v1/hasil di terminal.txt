@@ -1,0 +1,637 @@
+package main
+
+import (
+	"bufio"
+	"encoding/csv"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"a21hc3NpZ25tZW50/helper"
+	"a21hc3NpZ25tZW50/model"
+)
+
+const (
+	maxLoginAttempts  = 3
+	minStudentsImport = 3000
+	registerDelay     = 30 * time.Millisecond
+	assignmentDelay   = 30 * time.Millisecond
+)
+
+type StudentManager interface {
+	Login(id string, name string) (string, error)
+	Register(id string, name string, studyProgram string) (string, error)
+	GetStudyProgram(code string) (string, error)
+	ModifyStudent(name string, fn model.StudentModifier) (string, error)
+}
+
+type InMemoryStudentManager struct {
+	sync.Mutex
+	students             []model.Student
+	studentStudyPrograms map[string]string
+	failedLoginAttempts  map[string]int
+}
+
+func NewInMemoryStudentManager() *InMemoryStudentManager {
+	return &InMemoryStudentManager{
+		students: []model.Student{
+			{ID: "A12345", Name: "Aditira", StudyProgram: "TI"},
+			{ID: "B21313", Name: "Dito", StudyProgram: "TK"},
+			{ID: "A34555", Name: "Afis", StudyProgram: "MI"},
+		},
+		studentStudyPrograms: map[string]string{
+			"TI": "Teknik Informatika",
+			"TK": "Teknik Komputer",
+			"SI": "Sistem Informasi",
+			"MI": "Manajemen Informasi",
+		},
+		failedLoginAttempts: map[string]int{},
+	}
+}
+
+func ReadStudentsFromCSV(filename string) ([]model.Student, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = 3 // ID, Name, and StudyProgram
+
+	var students []model.Student
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		student := model.Student{
+			ID:           record[0],
+			Name:         record[1],
+			StudyProgram: record[2],
+		}
+		students = append(students, student)
+	}
+	return students, nil
+}
+
+func (sm *InMemoryStudentManager) GetStudents() []model.Student {
+	return sm.students
+}
+
+func (sm *InMemoryStudentManager) Login(id, name string) (string, error) {
+	if id == "" || name == "" {
+		return "", errors.New("ID or Name is undefined")
+	}
+
+	for _, student := range sm.students {
+		if student.ID == id && student.Name == name {
+			delete(sm.failedLoginAttempts, id)
+			return fmt.Sprintf("Login berhasil: Selamat datang %s! Kamu terdaftar di program studi: %s", name, sm.studentStudyPrograms[student.StudyProgram]), nil
+		}
+	}
+
+	sm.failedLoginAttempts[id]++
+	if sm.failedLoginAttempts[id] > maxLoginAttempts {
+		delete(sm.failedLoginAttempts, id)
+		return "", errors.New("Login gagal: Batas maksimum login terlampaui")
+	}
+	return "", errors.New("Login gagal: data mahasiswa tidak ditemukan")
+}
+
+func (sm *InMemoryStudentManager) Register(id, name, studyProgram string) (string, error) {
+	time.Sleep(registerDelay)
+
+	sm.Lock()
+	defer sm.Unlock()
+
+	if id == "" || name == "" || studyProgram == "" {
+		return "", errors.New("ID, Name or StudyProgram is undefined!")
+	}
+
+	if _, found := sm.studentStudyPrograms[studyProgram]; !found {
+		return "", fmt.Errorf("Study program %s is not found", studyProgram)
+	}
+
+	for _, student := range sm.students {
+		if student.ID == id {
+			return "", errors.New("Registrasi gagal: id sudah digunakan")
+		}
+	}
+
+	sm.students = append(sm.students, model.Student{
+		ID:           id,
+		Name:         name,
+		StudyProgram: studyProgram,
+	})
+	return fmt.Sprintf("Registrasi berhasil: %s (%s)", name, studyProgram), nil
+}
+
+func (sm *InMemoryStudentManager) GetStudyProgram(code string) (string, error) {
+	if code == "" {
+		return "", errors.New("Code is undefined")
+	}
+
+	if program, exists := sm.studentStudyPrograms[code]; exists {
+		return program, nil
+	}
+	return "", errors.New("Kode program studi tidak ditemukan")
+}
+
+func (sm *InMemoryStudentManager) ModifyStudent(name string, fn model.StudentModifier) (string, error) {
+	for i, student := range sm.students {
+		if student.Name == name {
+			err := fn(&sm.students[i])
+			if err != nil {
+				return "", errors.New("Mahasiswa tidak ditemukan")
+			}
+			return "Program studi mahasiswa berhasil diubah.", nil
+		}
+	}
+	return "", errors.New("Mahasiswa tidak ditemukan")
+}
+
+func (sm *InMemoryStudentManager) ChangeStudyProgram(programStudi string) model.StudentModifier {
+	return func(s *model.Student) error {
+		newProgram, found := sm.studentStudyPrograms[programStudi]
+		if !found {
+			return errors.New("Kode program studi tidak ditemukan")
+		}
+		s.StudyProgram = newProgram
+		return nil
+	}
+}
+
+func (sm *InMemoryStudentManager) ImportStudents(filenames []string) error {
+	errCh := make(chan error)
+	var finalErr error
+
+	var totalStudents int
+
+	var wg sync.WaitGroup
+	wg.Add(len(filenames))
+	for _, filename := range filenames {
+		go func(filename string) {
+			defer wg.Done()
+			time.Sleep(50 * time.Millisecond)
+			students, err := ReadStudentsFromCSV(filename)
+			if err != nil {
+				log.Println("Error importing students:", err)
+				errCh <- err
+				return
+			}
+			sm.Lock()
+			sm.students = append(sm.students, students...)
+			sm.Unlock()
+
+			totalStudents += len(students)
+		}(filename)
+	}
+
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		finalErr = nil
+	}
+
+	if totalStudents < minStudentsImport {
+		return errors.New("Total number of students imported is less than 3000")
+	}
+
+	return finalErr
+}
+
+func (sm *InMemoryStudentManager) SubmitAssignmentLongProcess() {
+	time.Sleep(assignmentDelay)
+}
+
+func (sm *InMemoryStudentManager) SubmitAssignments(numAssignments int) {
+	start := time.Now()
+	c := make(chan int)
+	var wg sync.WaitGroup
+	go func() {
+		for i := 1; i <= numAssignments; i++ {
+			c <- i
+		}
+		close(c)
+	}()
+
+	for i := 1; i <= 3; i++ {
+		wg.Add(1)
+		go func() {
+			for taskNumber := range c {
+				fmt.Printf("worker %d started task %d\n", i, taskNumber)
+				sm.SubmitAssignmentLongProcess()
+				fmt.Printf("worker %d completed task %d\n", i, taskNumber)
+			}
+			defer wg.Done()
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+	fmt.Printf("Submitting %d assignments took %s\n", numAssignments, elapsed)
+}
+
+func main() {
+	manager := NewInMemoryStudentManager()
+
+	for {
+		helper.ClearScreen()
+		students := manager.GetStudents()
+		for _, student := range students {
+			fmt.Printf("ID: %s\n", student.ID)
+			fmt.Printf("Name: %s\n", student.Name)
+			fmt.Printf("Study Program: %s\n", student.StudyProgram)
+			fmt.Println()
+		}
+
+		fmt.Println("Selamat datang di Student Portal!")
+		fmt.Println("1. Login")
+		fmt.Println("2. Register")
+		fmt.Println("3. Get Study Program")
+		fmt.Println("4. Modify Student")
+		fmt.Println("5. Bulk Import Student")
+		fmt.Println("6. Submit assignment")
+		fmt.Println("7. Exit")
+
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Print("Pilih menu: ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		switch input {
+		case "1":
+			helper.ClearScreen()
+			fmt.Println("=== Login ===")
+			fmt.Print("ID: ")
+			id, _ := reader.ReadString('\n')
+			id = strings.TrimSpace(id)
+
+			fmt.Print("Name: ")
+			name, _ := reader.ReadString('\n')
+			name = strings.TrimSpace(name)
+
+			msg, err := manager.Login(id, name)
+			if err != nil {
+				log.Println("Error during login:", err)
+			}
+			fmt.Println(msg)
+			fmt.Println("Press any key to continue...")
+			reader.ReadString('\n')
+		case "2":
+			helper.ClearScreen()
+			fmt.Println("=== Register ===")
+			fmt.Print("ID: ")
+			id, _ := reader.ReadString('\n')
+			id = strings.TrimSpace(id)
+
+			fmt.Print("Name: ")
+			name, _ := reader.ReadString('\n')
+			name = strings.TrimSpace(name)
+
+			fmt.Print("Study Program Code (TI/TK/SI/MI): ")
+			code, _ := reader.ReadString('\n')
+			code = strings.TrimSpace(code)
+
+			msg, err := manager.Register(id, name, code)
+			if err != nil {
+				log.Println("Error during registration:", err)
+			}
+			fmt.Println(msg)
+			fmt.Println("Press any key to continue...")
+			reader.ReadString('\n')
+		case "3":
+			helper.ClearScreen()
+			fmt.Println("=== Get Study Program ===")
+			fmt.Print("Program Code (TI/TK/SI/MI): ")
+			code, _ := reader.ReadString('\n')
+			code = strings.TrimSpace(code)
+
+			if studyProgram, err := manager.GetStudyProgram(code); err != nil {
+				log.Println("Error getting study program:", err)
+			} else {
+				fmt.Printf("Program Studi: %s\n", studyProgram)
+			}
+			fmt.Println("Press any key to continue...")
+			reader.ReadString('\n')
+		case "4":
+			helper.ClearScreen()
+			fmt.Println("=== Modify Student ===")
+			fmt.Print("Name: ")
+			name, _ := reader.ReadString('\n')
+			name = strings.TrimSpace(name)
+
+			fmt.Print("Program Studi Baru (TI/TK/SI/MI): ")
+			code, _ := reader.ReadString('\n')
+			code = strings.TrimSpace(code)
+
+			msg, err := manager.ModifyStudent(name, manager.ChangeStudyProgram(code))
+			if err != nil {
+				log.Println("Error modifying student:", err)
+			}
+			fmt.Println(msg)
+			fmt.Println("Press any key to continue...")
+			reader.ReadString('\n')
+		case "5":
+			helper.ClearScreen()
+			fmt.Println("=== Bulk Import Student ===")
+
+			csvFiles := []string{"students1.csv", "students2.csv", "students3.csv"}
+
+			err := manager.ImportStudents(csvFiles)
+			if err != nil {
+				log.Println("Error importing students:", err)
+			} else {
+				fmt.Println("Import successful!")
+			}
+			fmt.Println("Press any key to continue...")
+			reader.ReadString('\n')
+
+		case "6":
+			helper.ClearScreen()
+			fmt.Println("=== Submit Assignment ===")
+
+			fmt.Print("Enter the number of assignments you want to submit: ")
+			numAssignments, _ := reader.ReadString('\n')
+			numAssignments = strings.TrimSpace(numAssignments)
+			numAssignmentsInt, err := strconv.Atoi(numAssignments)
+
+			if err != nil {
+				fmt.Println("Error: Please enter a valid number")
+			}
+
+			manager.SubmitAssignments(numAssignmentsInt)
+
+			fmt.Println("Press any key to continue...")
+			reader.ReadString('\n')
+		case "7":
+			helper.ClearScreen()
+			fmt.Println("Goodbye!")
+			return
+		default:
+			helper.ClearScreen()
+			fmt.Println("Pilihan tidak valid!")
+			helper.Delay(5)
+		}
+
+		fmt.Println()
+	}
+}
+
+
+
+
+
+
+PS C:\Users\ASUS\grader\assignments\fcp-golang-lanjutan-student-portal-concurrent-v1> grader-cli submit -v
+[+] uploading file go.sum
+[+] uploading file students1.csv        
+[+] uploading file students2.csv        
+[+] uploading file students3.csv        
+[+] uploading file main.go
+[+] uploading file model/model.go       
+[+] uploading file go.mod
+[+] uploading file README.md
+[+] uploading file assignment-config.json
+[+] uploading file golang_suite_test.go 
+[+] uploading file helper/helper.go
+[+] uploading file main_test.go
+[+] file main_test.go uploaded
+[+] file students2.csv uploaded
+[+] file go.sum uploaded
+[+] file helper/helper.go uploaded
+[+] file model/model.go uploaded        
+[+] file golang_suite_test.go uploaded  
+[+] file assignment-config.json uploaded
+[+] file students1.csv uploaded
+[+] file main.go uploaded
+[+] file README.md uploaded
+[+] file students3.csv uploaded
+[+] file go.mod uploaded
+[+] submitting answer for grading       
+Running Suite: Golang Suite - /tmp/workdir1-rGVbqfJgRJ-1713616280580417452      
+==========================================================================      
+Random Seed: 1713616284
+
+Will run 19 of 19 specs
+•
+------------------------------
+• [FAILED] [0.000 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  Login
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:35
+    when the ID and name match a student record
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:36
+      [It] should return success message
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:37
+
+  Expected
+      <string>: "Selama..."
+  to equal       |
+      <string>: "Login ..."
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:39      
+------------------------------
+••••
+------------------------------
+• [FAILED] [0.000 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  Login
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:35
+    when an invalid ID and name are used more than 3 times
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:68
+      [It] should reset the count after a successful login
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:88
+
+  Expected
+      <string>: "Selama..."
+  to equal       |
+      <string>: "Login ..."
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:99      
+------------------------------
+• [FAILED] [0.011 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  Register
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:118
+    when all required fields are provided and ID is unique
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:119
+      [It] should add the student to the list
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:120
+
+  Expected
+      <string>: Registrasi berhasil untuk Citra & C12345
+  to equal
+      <string>: Registrasi berhasil: Citra (SI)
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:122     
+------------------------------
+• [FAILED] [0.011 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  Register
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:118
+    when ID is already used
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:133
+      [It] should return an error       
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:134
+
+  Expected
+      <string>: ID, Name or StudyProgram is undefined!
+  to equal
+      <string>: Registrasi gagal: id sudah digunakan
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:138     
+------------------------------
+• [FAILED] [0.011 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  Register
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:118
+    when ID, Name or StudyProgram is empty
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:142
+      [It] should return an error       
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:143
+
+  Expected
+      <string>: Registrasi berhasil untuk  &
+  to equal
+      <string>:
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:145     
+------------------------------
+• [FAILED] [0.011 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  Register
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:118
+    when StudyProgram is invalid        
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:151
+      [It] should return an error       
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:152
+
+  Expected
+      <string>: Registrasi berhasil untuk Citra & C12345
+  to equal
+      <string>:
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:154     
+------------------------------
+•••
+------------------------------
+• [FAILED] [0.000 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  ModifyStudent
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:187
+    when given an existing student name 
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:188
+      [It] should modify the student's study program
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:189
+
+  Expected
+      <string>: program studi mahasiswa berhasil diubah
+  to equal
+      <string>: Program studi mahasiswa berhasil diubah.
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:194     
+------------------------------
+•
+------------------------------
+• [FAILED] [10.516 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  ImportStudents
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:213
+    when given several large valid CSV files
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:214
+      [It] should import the students quickly, less than 300ms, but more than 50ms
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:215
+
+  Expected
+      <time.Duration>: 10516095290      
+  to be <
+      <time.Duration>: 300000000        
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:228     
+------------------------------
+• [SLOW TEST] [10.484 seconds]
+Main ImportStudents when given several large valid CSV files should correctly import the students
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:234
+------------------------------
+Worker 3: Processing assignment 1       
+Worker 2: Processing assignment 3       
+Worker 1: Processing assignment 2       
+Worker 1: Finished assignment 2
+Worker 1: Processing assignment 4       
+Worker 3: Finished assignment 1
+Worker 3: Processing assignment 5       
+Worker 2: Finished assignment 3
+Worker 2: Processing assignment 6       
+Worker 3: Finished assignment 5
+Worker 3: Processing assignment 7       
+Submitting 10 assignments took 62.351816ms
+Worker 2: Finished assignment 6
+Worker 2: Processing assignment 8       
+Worker 1: Finished assignment 4
+Worker 1: Processing assignment 9       
+• [FAILED] [0.063 seconds]
+Main
+/tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:12
+  SubmitAssignment
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:255
+    when student submit assignments     
+    /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:256
+      [It] should submit the assignment quickly, less than 100ms
+      /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:257
+
+  Expected
+      <time.Duration>: 62382359
+  to be >
+      <time.Duration>: 110000000        
+  In [It] at: /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:263     
+------------------------------
+
+
+Summarizing 9 Failures:
+  [FAIL] Main Login when the ID and name match a student record [It] should return success message
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:39
+  [FAIL] Main Login when an invalid ID and name are used more than 3 times [It] should reset the count after a successful login
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:99
+  [FAIL] Main Register when all required fields are provided and ID is unique [It] should add the student to the list   
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:122
+  [FAIL] Main Register when ID is already used [It] should return an error      
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:138
+  [FAIL] Main Register when ID, Name or StudyProgram is empty [It] should return an error
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:145
+  [FAIL] Main Register when StudyProgram is invalid [It] should return an error 
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:154
+  [FAIL] Main ModifyStudent when given an existing student name [It] should modify the student's study program
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:194
+  [FAIL] Main ImportStudents when given several large valid CSV files [It] should import the students quickly, less than 300ms, but more than 50ms
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:228
+  [FAIL] Main SubmitAssignment when student submit assignments [It] should submit the assignment quickly, less than 100ms
+  /tmp/workdir1-rGVbqfJgRJ-1713616280580417452/main_test.go:263
+
+Ran 19 of 19 Specs in 21.109 seconds    
+FAIL! -- 10 Passed | 9 Failed | 0 Pending | 0 Skipped
+--- FAIL: TestGolang (21.11s)
+FAIL
+exit status 1
+FAIL    a21hc3NpZ25tZW50        21.117s 
+
+[+] submit success
++------------+---------+--------+---------+-------+
+| TOTAL TEST | SUCCESS | FAILED | SKIPPED | SCORE |
++------------+---------+--------+---------+-------+
+|         19 |      10 |      9 |       0 | 52.63 |
++------------+---------+--------+---------+-------+
+PS C:\Users\ASUS\grader\assignments\fcp-golang-lanjutan-student-portal-concurrent-v1>
